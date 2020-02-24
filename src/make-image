@@ -1,0 +1,171 @@
+#!/bin/sh -x
+
+echo ${ALPINE_MIRROR}/edge/testing >>/etc/apk/repositories && apk add util-linux e2fsprogs-extra dosfstools parted udev zerofree subversion tar mkinitfs dpkg
+
+OUTPUT_IMG="/img/alpine-rpi-$ALPINE_VERSION-$ARCH.img"
+
+rm -Rf "$OUTPUT_IMG"
+truncate -s 2G "$OUTPUT_IMG"
+
+fdisk -H 255 -S 63 "$OUTPUT_IMG" <<EOF
+o
+n
+p
+1
+
++128MB
+t
+c
+n
+p
+2
+
+
+w
+EOF
+
+LOOP_DEV=$(losetup --partscan --show --find "${OUTPUT_IMG}")
+BOOT_DEV="$LOOP_DEV"p1
+ROOT_DEV="$LOOP_DEV"p2
+
+# format partitions
+mkfs.fat -F32 -n ALPINE "$BOOT_DEV"
+mkfs.ext4 "$ROOT_DEV"
+mkdir -p /genepi
+mount --make-private "$ROOT_DEV" /genepi
+mkdir -p /genepi/boot
+mount --make-private "$BOOT_DEV" /genepi/boot
+
+if [ ! -d ${CACHE_DIR}/kernel_repo ]
+then
+  mkdir -p ${CACHE_DIR}/kernel_repo
+  svn export --force ${KERNEL_REPO}/trunk/boot ${CACHE_DIR}/kernel_repo/boot 1>/dev/null
+  svn export --force ${KERNEL_REPO}/trunk/modules ${CACHE_DIR}/kernel_repo/modules 1>/dev/null
+fi
+if [ ! -f ${CACHE_DIR}/alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz ]
+then
+  wget -qO ${CACHE_DIR}/alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz "${ALPINE_MIRROR}/v$(echo ${ALPINE_VERSION} | cut -d. -f1,2)/releases/${ARCH}/alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz"
+fi
+
+cp -rpT ${CACHE_DIR}/kernel_repo/boot /genepi/boot
+mkdir -p /genepi/lib/modules
+if [ -n "${KERNEL_VERSION}" ]
+then
+  cp -rp ${CACHE_DIR}/kernel_repo/modules/${KERNEL_VERSION} /genepi/lib/modules/
+fi
+if [ -n "${KERNEL_BUILD_DIR}" ]
+then
+  export KERNEL_VERSION=$(ls -1 ${KERNEL_BUILD_DIR}/kernel-install/lib/modules/)
+  cp ${KERNEL_BUILD_DIR}/arch/*/boot/*Image /genepi/boot/kernel8.img
+  cp ${KERNEL_BUILD_DIR}/arch/*/boot/dts/broadcom/*.dtb /genepi/boot/
+  cp -rp ${KERNEL_BUILD_DIR}/kernel-install/lib/modules/${KERNEL_VERSION} /genepi/lib/modules/
+fi
+echo "arm_64bit=1" >/genepi/boot/config.txt
+
+tar -xzf ${CACHE_DIR}/alpine-minirootfs-${ALPINE_VERSION}-${ARCH}.tar.gz -C /genepi
+
+cp -p /lib/ld-musl-x86_64.so.1 /lib/libc.musl-x86_64.so.1 /genepi/lib/
+mv /genepi/bin/busybox /genepi/bin/busybox.arm && cp -p /bin/busybox /genepi/bin/busybox
+echo ${ALPINE_MIRROR}/edge/community >>/genepi/etc/apk/repositories
+apk add --root /genepi --arch ${ARCH} --no-scripts ca-certificates
+apk add --root /genepi --arch ${ARCH} busybox-initscripts openrc dosfstools e2fsprogs-extra parted multipath-tools chrony openssh-server bluez bluez-deprecated
+
+if [ -f keys.bmap.gz ]
+then
+  cp -p keys.bmap.gz /genepi/etc/keymap/keys.bmap.gz
+  sed -i '/^KEYMAP=/ c\ KEYMAP=/etc/keymap/keys.bmap.gz' /genepi/etc/conf.d/loadkmap
+fi
+cat <<EOF > /genepi/usr/bin/first-boot
+#!/bin/sh
+set -xe
+
+if [ ! -f /first-boot-parted ]
+then
+  parted /dev/mmcblk0 ---pretend-input-tty resizepart 2 100% I && touch /first-boot-parted
+  partprobe /dev/mmcblk0
+  if [ $? -ne 0 ]
+  then
+    reboot
+    exit
+  fi
+fi
+resize2fs /dev/mmcblk0p2
+rc-update del first-boot
+rm /etc/init.d/first-boot /usr/bin/first-boot /first-boot-parted
+
+fallocate -l 1g /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+echo "/swapfile       none            swap    sw                0       0" >> /etc/fstab
+
+reboot
+EOF
+cat <<EOF > /genepi/etc/init.d/first-boot
+#!/sbin/openrc-run
+command="/usr/bin/first-boot"
+command_background=false
+depend() {
+  after modules
+  need localmount
+}
+EOF
+chmod +x /genepi/etc/init.d/first-boot /genepi/usr/bin/first-boot
+
+cat <<EOF > /genepi/etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+
+EOF
+
+apk add --root /genepi bluez bluez-deprecated
+sed -i '/bcm43xx/s/^#//' /genepi/etc/mdev.conf
+
+ln -s /etc/init.d/first-boot /genepi/etc/runlevels/sysinit/first-boot
+ln -s /etc/init.d/chronyd /genepi/etc/runlevels/default/chronyd
+
+if [ -n "${ROOT_PASSWORD}" ]; then
+  echo "root:${ROOT_PASSWORD}" | chpasswd && sed -i "/^root:/ c\
+$(grep -e '^root:' /etc/shadow)" /genepi/etc/shadow && echo "PermitRootLogin yes" >>/genepi/etc/ssh/sshd_config && echo "ssh root password : ${ROOT_PASSWORD}"
+fi
+
+mv /genepi/bin/busybox.arm /genepi/bin/busybox
+mkinitfs -b /genepi -o /genepi/boot/initrd.gz "${KERNEL_VERSION}"
+rm /genepi/lib/ld-musl-x86_64.so.1 /genepi/lib/libc.musl-x86_64.so.1
+
+# RPI 4 Wifi does not work with firmwaresfrom RPi-Distro repo, so we take them from Raspbian Buster from now
+# svn export --force https://github.com/RPi-Distro/firmware-nonfree/trunk/brcm /genepi/lib/firmware/brcm/
+# svn export --force https://github.com/RPi-Distro/bluez-firmware/trunk/broadcom /genepi/lib/firmware/brcm/
+wget -qO- https://archive.raspberrypi.org/debian/pool/main/f/firmware-nonfree/firmware-brcm80211_20190114-1+rpt2_all.deb | dpkg -x - /genepi
+wget -qO- https://archive.raspberrypi.org/debian/pool/main/b/bluez-firmware/bluez-firmware_1.2-4+rpt2_all.deb | dpkg -x - /genepi
+
+rm -rf /genepi/var/lib/apt/lists/* /genepi/var/cache/apk/* /genepi/root/* /genepi/bootstrap
+find /genepi -iname "*-" -delete
+find /genepi -iname "*~" -delete
+
+umount -lf /genepi
+
+# shrink image
+ROOT_PART_START=$(parted -ms "$OUTPUT_IMG" unit B print | tail -n 1 | cut -d ':' -f 2 | tr -d 'B')
+ROOT_BLOCK_SIZE=$(tune2fs -l "$ROOT_DEV" | grep '^Block size:' | tr -d ' ' | cut -d ':' -f 2)
+ROOT_MIN_SIZE=$(resize2fs -P "$ROOT_DEV" | cut -d ':' -f 2 | tr -d ' ')
+
+# shrink fs
+e2fsck -f -p "$ROOT_DEV"
+resize2fs -p "$ROOT_DEV" $ROOT_MIN_SIZE
+
+# shrink partition
+PART_END=$(($ROOT_PART_START + ($ROOT_MIN_SIZE * $ROOT_BLOCK_SIZE)))
+parted ---pretend-input-tty "$OUTPUT_IMG" unit B resizepart 2 $PART_END yes
+
+losetup -d "$LOOP_DEV"
+
+# truncate free space
+FREE_START=$(parted -ms "$OUTPUT_IMG" unit B print free | tail -1 | cut -d ':' -f 2 | tr -d 'B')
+truncate -s $FREE_START "$OUTPUT_IMG"
+
+gzip -f "$OUTPUT_IMG"
+
+echo "DONE."

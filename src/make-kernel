@@ -1,0 +1,54 @@
+#!/bin/sh
+
+apk add git wget build-base cmake autoconf automake
+
+export TOOLCHAIN=$TOOLCHAIN_DIR/$TARGET_ARCH
+mkdir -p $TOOLCHAIN && cd $TOOLCHAIN
+
+if [ ! -d binutils-2.32-build ]
+then
+    wget -qO- https://ftp.gnu.org/gnu/binutils/binutils-2.32.tar.bz2  | tar xj && \
+    mkdir binutils-2.32-build
+fi
+cd binutils-2.32-build && \
+../binutils-2.32/configure --prefix="$TOOLCHAIN" --target=$TARGET_ARCH-linux-gnu --disable-nls && \
+make -j5 && \
+make install
+
+apk add gmp-dev mpfr-dev mpc1-dev
+if [ ! -d gcc-9.1.0-build ]
+then
+    wget -qO- https://ftp.gnu.org/gnu/gcc/gcc-9.1.0/gcc-9.1.0.tar.gz | tar xz && \
+    mkdir gcc-9.1.0-build
+fi
+cd gcc-9.1.0-build && \
+../gcc-9.1.0/configure --prefix="$TOOLCHAIN" \
+    --target=$TARGET_ARCH-linux-gnu --with-newlib --without-headers \
+    --disable-nls --disable-shared --disable-threads --disable-libssp --disable-decimal-float --disable-libquadmath \
+    --disable-libvtv --disable-libgomp --disable-libatomic \
+    --enable-languages=c && \
+make all-gcc -j5 && \
+make install-gcc
+
+export PATH=$PATH:$TOOLCHAIN/bin
+
+apk add bison flex bc kmod openssl-dev
+
+if [ ! -d $SOURCE_DIR ]
+then
+    git clone --depth=1 $RPI_REPO $SOURCE_DIR
+    cd $SOURCE_DIR
+    git checkout origin/$RPI_BRANCH
+    cp /src/logo_linux_clut224.ppm $SOURCE_DIR/drivers/video/logo/logo_linux_clut224.ppm
+else
+    cd $SOURCE_DIR
+fi
+
+make O=$KERNEL_BUILD_DIR ARCH=$ARCH CROSS_COMPILE=$TARGET_ARCH-linux-gnu- bcm2711_defconfig && \
+    make -j5 O=$KERNEL_BUILD_DIR ARCH=arm64 CROSS_COMPILE=$TARGET_ARCH-linux-gnu-
+
+export KERNEL_VERSION=`cat $KERNEL_BUILD_DIR/include/generated/utsrelease.h | sed -e 's/.*"\(.*\)".*/\1/'`
+mkdir -p /lib/modules && \
+    make -j5 O=$KERNEL_BUILD_DIR DEPMOD=echo MODLIB=$KERNEL_BUILD_DIR/kernel-install/lib/modules/${KERNEL_VERSION} INSTALL_FW_PATH=$KERNEL_BUILD_DIR/kernel-install/lib/firmware modules_install
+
+depmod --basedir $KERNEL_BUILD_DIR/kernel-install "$KERNEL_VERSION"

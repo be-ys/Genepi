@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+docker run --privileged --rm -v /dev:/dev:ro -v "$PWD/src":/src -v "$PWD/img":/img -w /src \
+    -e RPI_REPO="https://github.com/raspberrypi/linux.git" \
+    -e RPI_BRANCH=rpi-4.19.y \
+    -e ARCH=arm64 \
+    -e TARGET_ARCH=aarch64 \
+    -e TOOLCHAIN_DIR=/img/toolchains \
+    -e SOURCE_DIR=/img/rpi-linux \
+    -e KERNEL_BUILD_DIR=/img/rpi-kernel \
+    alpine ./make-kernel
